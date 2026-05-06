@@ -23,19 +23,21 @@ def is_root():
     return os.geteuid() == 0
 
 def block_ip(ip, dry_run=False):
-    """Block the specified IP using UFW."""
+    """Block the specified IP for SSH (port 22/tcp) using UFW."""
     if dry_run:
-        print(f"[DRY-RUN] Would block IP: {ip}")
+        print(f"[DRY-RUN] Would block IP on SSH (22/tcp): {ip}")
         return True
-    
+
     if ip in blocked_ips:
         return False
 
     try:
-        print(f"[ACTION] Blocking IP: {ip} due to excessive SSH attempts (> {THRESHOLD} in {WINDOW}s)...")
-        # Using subprocess to interact with UFW safely
-        result = subprocess.run([FIREWALL_CMD, "deny", "from", ip], 
-                                capture_output=True, text=True, check=True)
+        print(f"[ACTION] Blocking IP on SSH (22/tcp): {ip} (> {THRESHOLD} failed attempts in {WINDOW}s)...")
+        # Block only SSH traffic from this IP (more precise for the assignment)
+        result = subprocess.run(
+            [FIREWALL_CMD, "deny", "from", ip, "to", "any", "port", "22", "proto", "tcp"],
+            capture_output=True, text=True, check=True
+        )
         print(f"[SUCCESS] {result.stdout.strip()}")
         blocked_ips.add(ip)
         return True
@@ -52,7 +54,7 @@ def tail_file(filename):
             while True:
                 line = f.readline()
                 if not line:
-                    time.sleep(0.1) # Wait for new entries
+                    time.sleep(0.1)  # Wait for new entries
                     continue
                 yield line
     except KeyboardInterrupt:
@@ -61,43 +63,45 @@ def tail_file(filename):
         print(f"[ERROR] Could not read {filename}: {e}", file=sys.stderr)
 
 def extract_ip(line):
-    """Extract IP address from an SSH login attempt log line."""
-    # Common log patterns for SSH connections and failures:
-    # "sshd[...]: Failed password for invalid user bistu2 from 193.32.162.82 port 35556 ssh2"
-    # "sshd[...]: Invalid user bistu2 from 193.32.162.82 port 35556"
-    # "sshd[...]: Accepted password for root from 1.2.3.4 port 12345"
-    if "sshd" in line:
-        # Match 'from <IP>'
-        match = re.search(r"from ([\d\.]+)", line)
-        if match:
-            return match.group(1)
-    return None
+    """Extract IP address ONLY from FAILED SSH login attempts."""
+    if "sshd" not in line:
+        return None
+
+    # Count only brute-force style failures (not successful logins)
+    failure_markers = ("Failed password", "Invalid user", "authentication failure")
+    if not any(m in line for m in failure_markers):
+        return None
+
+    # Match 'from <IP>'
+    match = re.search(r"from ([\d\.]+)", line)
+    return match.group(1) if match else None
 
 def monitor(log_path, dry_run=False):
     """Monitor SSH logs and block IPs exceeding threshold."""
     print(f"[INFO] Monitoring {log_path} for SSH brute-force attempts...")
-    print(f"[INFO] Settings: Threshold = {THRESHOLD}, Window = {WINDOW}s, Mode = {'DRY-RUN' if dry_run else 'ACTIVE'}")
+    print(f"[INFO] Settings: Threshold = {THRESHOLD} (block on attempt #{THRESHOLD + 1}), Window = {WINDOW}s, Mode = {'DRY-RUN' if dry_run else 'ACTIVE'}")
 
     for line in tail_file(log_path):
         ip = extract_ip(line)
         if ip:
             now = time.time()
+
             # Add current attempt timestamp
             attempts[ip].append(now)
-            
+
             # Remove timestamps older than the sliding window
             while attempts[ip] and attempts[ip][0] < now - WINDOW:
                 attempts[ip].popleft()
-            
-            # Check if threshold exceeded
+
+            # Check if threshold exceeded (e.g., THRESHOLD=3 => block on 4th failed attempt within window)
             if len(attempts[ip]) > THRESHOLD:
                 block_ip(ip, dry_run)
-                # Cleanup to avoid repeated blocking signals for the same window
-                # The firewall will handle the actual block.
+
+                # Cleanup to avoid repeated signals for the same IP within the same window.
                 attempts[ip].clear()
 
 def main():
-    parser = argparse.ArgumentParser(description="SSH Brute-Force Blocker")
+    parser = argparse.ArgumentParser(description="SSH Brute-Force Blocker (UFW)")
     parser.add_argument("--log", default=LOG_FILE, help=f"Path to SSH auth log (default: {LOG_FILE})")
     parser.add_argument("--dry-run", action="store_true", help="Simulate blocking without modifying firewall rules")
     args = parser.parse_args()
@@ -108,8 +112,8 @@ def main():
         sys.exit(1)
 
     if not os.path.exists(args.log):
-         print(f"[CRITICAL] Log file {args.log} does not exist.", file=sys.stderr)
-         sys.exit(1)
+        print(f"[CRITICAL] Log file {args.log} does not exist.", file=sys.stderr)
+        sys.exit(1)    
 
     monitor(args.log, args.dry_run)
 
